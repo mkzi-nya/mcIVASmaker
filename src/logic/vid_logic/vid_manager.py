@@ -2,10 +2,12 @@ import os
 import time
 from multiprocessing.pool import ThreadPool, Pool
 from multiprocessing import Queue, Manager
+from typing import Union, Callable, Optional, Any, Tuple
+import queue
+
 import src.ui_manager.PySimpleGUI as sg
 
 from src.logic.image_logic.image_manager import manipulate_image
-
 from src.logic.vid_logic import ffmpeg_manager
 from src.path_manager.pather import resource_path
 import logging
@@ -36,16 +38,36 @@ if not os.path.exists(vid_processed_folder):
 
 THREAD_KEY = '-Vid_Thread-'
 
+ProgressEvent = Tuple[str, Any]
+ProgressCallback = Optional[Callable[[ProgressEvent], None]]
 
-def vid_manager(window: sg.Window, filepath: str, output: str, manipulation: str, scale: str, details: dict):
+
+def vid_manager(
+    window: Union[sg.Window, None],
+    filepath: str,
+    output: str,
+    manipulation: str,
+    scale: Union[str, float, int],
+    details: dict,
+    progress_cb: ProgressCallback = None
+):
+    """Video pipeline manager. Works for both GUI (window!=None) and CLI (progress_cb!=None)."""
+
+    # Unified event dispatcher (GUI -> write_event_value, CLI -> callback)
+    def emit(ev: str, payload: Any = None):
+        if progress_cb is not None and window is None:
+            progress_cb((ev, payload))
+        elif window is not None:
+            window.write_event_value((THREAD_KEY, ev), payload)
+
     # Cleaning cache folders, incase a previous run failed to do so
     cleanup_folders()
     logger.info("Cleaned Previous Cache")
     logger.debug("Video Details:")
-    logger.debug("FilePath: " + filepath)
-    logger.debug("Output Path: " + output)
-    logger.debug("Manupilations: " + manipulation)
-    logger.debug("Scale: " + scale)
+    logger.debug(f"FilePath: {filepath}")
+    logger.debug(f"Output Path: {output}")
+    logger.debug(f"Manupilations: {manipulation}")
+    logger.debug(f"Scale: {scale}")
     logger.debug(f"Details: {details}")
 
     # Instantiating the process/thread related objects
@@ -57,22 +79,21 @@ def vid_manager(window: sg.Window, filepath: str, output: str, manipulation: str
 
     frame_count = ffmpeg_manager.get_frame_count(filepath, details['frame_rate'])
     # Close enough frame count
-    window.write_event_value((THREAD_KEY, '-Image_Count-'), frame_count)
+    emit('-Image_Count-', frame_count)
 
     # Selecting the correct cache folder
     cache_folder = vid_cache_folder_png if details['quality'] else vid_cache_folder_jpg
 
     # Running the encoder?(In another thread)
     ff_pool.apply_async(
-        ffmpeg_manager.vid_to_img, (filepath, details['frame_rate'], cache_folder),
-        callback=lambda x: print(f"Test {x}")
+        ffmpeg_manager.vid_to_img,
+        (filepath, details['frame_rate'], cache_folder),
+        callback=(lambda x: print(f"[ffmpeg extract] exit={x}")) if (progress_cb and window is None) else None
     )
-    ff_pool.apply_async(
-        ffmpeg_manager.vid_to_audio, (filepath,)
-    )
+    ff_pool.apply_async(ffmpeg_manager.vid_to_audio, (filepath,))
     ff_pool.close()
-    # Starting the image conversion, till at least 95% the images are there (Not all, because we don't get exact frame
-    # count with the get_frame_count
+
+    # Starting the image conversion, till at least 95% the images are there
     current_image = 0
     image_processes = []
     img_count = 0
@@ -82,10 +103,10 @@ def vid_manager(window: sg.Window, filepath: str, output: str, manipulation: str
         file_count = len(files)
         if file_count >= (frame_count * 0.95):
             break
-        # Updating the progress meter
-        window.write_event_value((THREAD_KEY, '-Img_Conversion-'), file_count / frame_count)
+        # Updating the progress meter (0..1 for extract phase)
+        emit('-Img_Conversion-', file_count / frame_count)
 
-        # Starting the processing of images to blocks, while ffmpeg is generating those images, to save time
+        # Start processing images while ffmpeg is generating them
         if file_count > current_image:
             img_file_path = os.path.join(cache_folder, files[current_image])
             # Remove the first 4 and last 4 characters, to get just the number
@@ -102,16 +123,17 @@ def vid_manager(window: sg.Window, filepath: str, output: str, manipulation: str
     ff_pool.join()
     logger.info("Converted Video to images")
 
-    # Run the already processing images and show their status
+    # Flush completed early processes
     for process in image_processes:
         process.wait()
-        window.write_event_value((THREAD_KEY, '-Image_Done-'), None)
+        emit('-Image_Done-', None)
         img_count += 1
 
     # Update images done
-    window.write_event_value((THREAD_KEY, '-Set_Images_Done-'), img_count)
-    # Video has now been converted to images and audio
-    window.write_event_value((THREAD_KEY, '-Img_Conversion-'), 1)
+    emit('-Set_Images_Done-', img_count)
+
+    # Extract done
+    emit('-Img_Conversion-', 1)
     logger.debug("Completed partial processing")
 
     # Getting the correct item count and finding which files we have to process now
@@ -121,9 +143,10 @@ def vid_manager(window: sg.Window, filepath: str, output: str, manipulation: str
     for completed_file in completed_files:
         file_no = completed_file.replace(".png", "")
         name_of_file = "file" + file_no + (".jpg" if cache_folder == vid_cache_folder_jpg else ".png")
-        files.remove(name_of_file)
+        if name_of_file in files:
+            files.remove(name_of_file)
 
-    window.write_event_value((THREAD_KEY, '-Image_Count-'), file_count)
+    emit('-Image_Count-', file_count)
 
     # Processing the rest of the images
     for unprocessed_file in files:
@@ -139,22 +162,24 @@ def vid_manager(window: sg.Window, filepath: str, output: str, manipulation: str
     process_pool.close()
     iter_count = 0
     while True:
-        # Updating the progress meters, till the all the processing has been done
-        data = event_queue.get()
-        if data[0] == "-Single_Frame-":
-            window['-Single_Frame-'](data[1])
-        # elif data[0] == "-Image_Done-":
-        #     window.write_event_value((THREAD_KEY, '-Image_Done-'), None)
-        #     img_count += 1
-        #     logger.debug("Processed: " + data[1])
+        try:
+            data = event_queue.get(timeout=0.2)  # 不阻塞太久，0.2s 轮询
+            if data[0] == "-Single_Frame-":
+                if window is not None:
+                    window['-Single_Frame-'](data[1])
+                emit('-Single_Frame-', data[1])
+            elif data[0] == "-Image_Done-":
+                # 可选：这里其实我们上面已经在 wait 后 emit 过一次，
+                # 如果你希望更顺滑，也可以在这里对 CLI 做一次进度+1
+                emit('-Image_Done-', None)
+        except queue.Empty:
+            pass
 
-        if all([proc.ready() for proc in image_processes]):
+        if all(proc.ready() for proc in image_processes):
             break
 
         iter_count += 1
-
-        # Update the images done progress bar, as event-based is too slow
-        if iter_count % 10 == 0:
+        if window is not None and iter_count % 10 == 0:
             processed_file_count = len(os.listdir(vid_processed_folder))
             progress = processed_file_count / file_count * 100
             window['-Number_Of_Frames-'](progress)
@@ -166,18 +191,20 @@ def vid_manager(window: sg.Window, filepath: str, output: str, manipulation: str
             indices = [i for i, x in enumerate(proc_list) if x]
             for index in indices:
                 logger.error(image_processes[index].get())
-            pass
 
     process_pool.join()
 
-    # If the processing was very fast, and happened before we caught up with the queue
-    # updating the progress meters indicating processing done
-    window['-Single_Frame-'](100)
-    for i in range(img_count, frame_count):
-        window.write_event_value((THREAD_KEY, '-Image_Done-'), None)
+    # If the processing was very fast, make sure we emit remaining done events
+    # GUI: just set the single-frame meter to 100
+    if window is not None:
+        window
+    # Emit missing '-Image_Done-' to match frame_count
+    for _ in range(img_count, frame_count):
+        emit('-Image_Done-', None)
 
-    window.write_event_value((THREAD_KEY, '-Img_Conversion-'), 1.4)
+    emit('-Img_Conversion-', 1.4)
     logger.info("Completed Image Processing")
+
     # Creating the ffmpeg run command
     if len(os.listdir(vid_cache_folder_m4a)) > 0:
         re_options = (
@@ -192,15 +219,16 @@ def vid_manager(window: sg.Window, filepath: str, output: str, manipulation: str
             f"-crf 20 -pix_fmt yuv420p {output}"
         )
     logger.debug("The ffmpeg converted join command: " + re_options)
-    ffmpeg_manager.ffmpeg_runner(
-        re_options
-    )
-    window.write_event_value((THREAD_KEY, '-Img_Conversion-'), 1.8)
+    ffmpeg_manager.ffmpeg_runner(re_options)
+
+    emit('-Img_Conversion-', 1.8)
     logger.info("Video Created")
+
     # Cleaning up the cache folders
     cleanup_folders()
     logger.info("Cleaning Cache")
-    window.write_event_value((THREAD_KEY, '-Img_Conversion-'), 2)
+
+    emit('-Img_Conversion-', 2)
     logger.info("Video Conversion Completed!")
 
 
@@ -224,7 +252,14 @@ def cleanup_folders():
 
 
 # Running this for every single frame
-def manage_single_image(event_queue: Queue, filename: str, output: str, manipulation: str, scale: str, details: dict):
+def manage_single_image(
+    event_queue: Queue,
+    filename: str,
+    output: str,
+    manipulation: str,
+    scale: Union[str, float, int],
+    details: dict
+):
     manipulation = manipulation.replace("Video", "Image")
     iteration = 0
     image_size = 1
@@ -235,7 +270,7 @@ def manage_single_image(event_queue: Queue, filename: str, output: str, manipula
             image_size = values
         iteration += 1
         # Updating the progress every certain amount of iterations
-        if iteration % round(image_size / updates) == 0:
+        if image_size and iteration % max(1, round(image_size / updates)) == 0:
             if isinstance(values, str):
                 pass
             else:

@@ -3,19 +3,51 @@ from src.logic.image_logic import image_to_redstone_lamps, img_to_blocks as img_
 import os
 import mcschematic
 import logging
+from typing import Union
 
 logger = logging.getLogger(__name__)
 
 
+def _normalize_scale_to_tile(step: Union[str, float, int]) -> int:
+    """
+    将用户传入的 scale 统一换算为算法需要的“瓦片步长”（用于 //scale 缩小），确保是 >=1 的整数。
+    规则：
+      - 如果是百分比字符串（如 "50%"、"12.5%"），先转成倍数（0.5、0.125），再计算。
+      - 如果是数字（0.5、1、2.0），直接作为倍数。
+      - 计算公式：tile = round(16 / 倍数)，并保证最小为 1。
+        例：1.0 → 16；0.5 → 32；2.0 → 8
+    """
+    # 解析成倍数
+    if isinstance(step, str):
+        s = step.strip()
+        if s.endswith('%'):
+            # 百分比 -> 倍数
+            mult = float(s[:-1]) / 100.0
+        else:
+            mult = float(s)
+    elif isinstance(step, (int, float)):
+        mult = float(step)
+    else:
+        raise ValueError(f"Invalid scale type: {type(step)}")
+
+    if mult <= 0:
+        raise ValueError(f"scale must be > 0, got {mult}")
+
+    tile = round(16.0 / mult)
+    if tile < 1:
+        tile = 1
+    return tile
+
+
 # Convert an image, to what the user specified
 def manipulate_image(
-        filepath: str, output: str, manipulation: str, crop: list | None, scale: str, details: dict
+        filepath: str, output: str, manipulation: str, crop: list | None, scale: Union[str, float, int], details: dict
 ):
     img = Image.open(filepath)
     # Validating the cropping
     if crop is not None:
         for i in range(4):
-            if len(crop[i]) > 8:
+            if len(str(crop[i])) > 8:
                 return False
 
             if crop[i] == "Max":
@@ -28,8 +60,8 @@ def manipulate_image(
         # Cropping the image
         img = img.crop((crop[0], crop[1], crop[2], crop[3]))
 
-    # Scale to numeric scale
-    scale: int = round(1 / int(scale[:-1]) * 16)
+    # Scale to numeric tile step (integer >= 1)
+    scale: int = _normalize_scale_to_tile(scale)
 
     # Getting the img to a multiple of 16 so textures match up
     if img.width % scale != 0:
@@ -125,11 +157,16 @@ def img_to_blocks(img: Image.Image, output: str, details: dict):
         else:
             yield value
     yield "Done Processing!"
+    # --- 这里开始是新增的容错 ---
+    ext = os.path.splitext(output)[1].lower()
+    if ext in ('.jpg', '.jpeg') and img.mode == 'RGBA':
+        # JPEG 不支持 alpha，退化为 RGB
+        img = img.convert('RGB')
+    # --- 新增结束 ---
     img.save(output)
     img.close()
     yield "Done!"
     return
-
 
 def img_to_blocks_schem(img: Image.Image, output: str, details: dict):
     schem: mcschematic.MCSchematic = ...
