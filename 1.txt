@@ -1,3 +1,0 @@
-python -m src.cli image any-image -i ../milthm-calculator-web/jpgs/ --scale 1 --side top -o ../milthm-img/
-python -m src.cli image any-image -i 1.jpg --scale 1.0 --side top --mode Blacklist --blocklist-file 生存.txt
-python -m src.cli image any-image -i 1.jpg --scale 1.0 --side top -o /sdcard/
