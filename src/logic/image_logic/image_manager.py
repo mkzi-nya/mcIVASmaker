@@ -12,8 +12,6 @@ from src.logic.image_logic.block_parser import block_parser
 
 logger = logging.getLogger(__name__)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-# 可选：Bedrock 结构导出（pip install mcstructure）
 try:
     from mcstructure import Block, Structure
 except Exception:
